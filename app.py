@@ -47,20 +47,26 @@ def format_notification(status: str, extra: str = "", error: str = "", expiry_da
         masked_email = EMAIL[:2] + '****'
 
     lines = [
-        "🌐 Pingless 续期通知",
+        "🚀 Pingless 续期通知",
         "",
         f"{status}",
-        f"👤 登录账户: {masked_email}",
     ]
     if expiry_date:
         lines.append(f"📅 到期时间: {expiry_date}")
     if extra:
+        lines.append("")
         lines.append(extra)
     if error:
         lines.append(f"⚠️ 错误信息: {error}")
+    lines.append("")
+    lines.append(f"👤 登录账户: {masked_email}")
     lines.append(f"⏱️ 登录时间: {now}")
     return "\n".join(lines)
     
+# 去掉倒计时末尾的 remaining（仅用于通知展示）
+def strip_remaining(t: str) -> str:
+    return re.sub(r"\s*remaining\s*$", "", t or "", flags=re.I).strip()
+
 # 获取当前出口ip
 def get_current_ip(proxy_server: str = "") -> str:
     proxies = None
@@ -416,6 +422,136 @@ def do_discord_login(sb) -> bool:
     return False
 
 
+# 处理单台服务器：从 servers 页面点击第 idx 行进入详情页并执行续期，返回结果摘要
+def process_server(sb, idx: int, total: int, server_name: str, server_status: str) -> str:
+    is_offline = server_status.lower() == "offline"
+    server_info = f"🖥️ 服务器[{idx + 1}/{total}]: {server_name or '未知'} ({server_status or '未知状态'})"
+
+    # 点击第 idx 个服务器行进入详情页
+    print(f"🖱️ 点击服务器 [{idx + 1}/{total}]，进入服务器详情页...")
+    try:
+        clicked = sb.execute_script(f"""
+            const rows = document.querySelectorAll('.server-row');
+            if (rows.length > {idx}) {{ rows[{idx}].click(); return true; }}
+            return false;
+        """)
+    except Exception:
+        clicked = False
+    if not clicked:
+        print(f"❌ 未找到第 {idx + 1} 个服务器行")
+        return f"{server_info}\n📋 续期结果: ❌ 未找到对应服务器行"
+    sb.wait_for_ready_state_complete()
+    sb.sleep(4)
+
+    # 校验是否到达服务器详情页（url 中包含 manage?id=）
+    current_url = sb.get_current_url()
+    if "manage?id=" not in current_url:
+        print(f"❌ 未到达服务器详情页，当前URL: {current_url}")
+        return f"{server_info}\n📋 续期结果: ❌ 未到达服务器详情页"
+    print(f"✅ 已到达服务器详情页: {current_url}")
+
+    # 获取 Next Renewal 倒计时（#renewal-time）
+    def get_renewal_time() -> str:
+        try:
+            if sb.is_element_present("#renewal-time"):
+                return sb.get_text("#renewal-time").strip()
+        except Exception:
+            pass
+        return ""
+
+    renewal_time_before = get_renewal_time()
+    print(f"⏳ Next Renewal: {renewal_time_before or '未获取到'}")
+
+    # 判断 Renewal 按钮是否可用（不可用时按钮带 hidden/disabled，页面显示 renewal-time 倒计时）
+    renew_available = False
+    if sb.is_element_present("#renew-server"):
+        btn_class = sb.get_attribute("#renew-server", "class") or ""
+        try:
+            sb.get_attribute("#renew-server", "disabled")
+            btn_disabled = True
+        except Exception:
+            btn_disabled = False
+        renew_available = ("hidden" not in btn_class) and (not btn_disabled)
+
+    if not renew_available:
+        print(f"ℹ️ 未到续期时间 (Next Renewal: {renewal_time_before or '未知'})")
+        return f"{server_info}\n📋 续期结果: ⏳ 未到续期时间\n📅 到期时间: {strip_remaining(renewal_time_before) or '未获取到'}"
+
+    # 点击 Renew Now 按钮执行续期
+    print("🔁 点击 Renew Now 按钮执行续期...")
+    sb.click("#renew-server")
+    sb.sleep(3)
+
+    # 等待 success 提示模态框（alert success）—— 模态框可能几秒就消失
+    success_text = ""
+    for _ in range(5):
+        try:
+            success_text = sb.execute_script("""
+                const els = document.querySelectorAll('[class*="alert"], [role="alert"], [class*="toast"], [class*="modal"]');
+                for (const el of els) {
+                    const cls = (el.className || '').toString().toLowerCase();
+                    const txt = (el.textContent || '').replace(/\\s+/g, ' ').trim();
+                    if (!txt) continue;
+                    if (cls.includes('success') || /success|renewed|续期成功/i.test(txt)) {
+                        return txt.slice(0, 200);
+                    }
+                }
+                return '';
+            """) or ""
+        except Exception:
+            success_text = ""
+        if success_text:
+            break
+        sb.sleep(1)
+
+    # 续期后再次检查 renewal-time
+    renewal_time_after = get_renewal_time()
+    print(f"⏳ 续期后 Next Renewal: {renewal_time_after or '未获取到'}")
+
+    # 判断续期是否成功：模态框检测到 或 renewal-time 发生明显变化
+    renewal_changed = (
+        renewal_time_after
+        and renewal_time_after != renewal_time_before
+        and "remaining" in renewal_time_after.lower()
+    )
+    renew_success = bool(success_text) or renewal_changed
+
+    if renew_success:
+        if success_text:
+            print(f"✅ 续期成功: {success_text}")
+        else:
+            print(f"✅ 续期成功（renewal-time 变化: {renewal_time_before} → {renewal_time_after}）")
+        # 如果服务器是 Offline 状态，续期后需要启动
+        if is_offline:
+            print("🔌 服务器为 Offline，尝试启动...")
+            started = False
+            for sel in ['button:contains("Start")', '#start-server', 'button:contains("启动")']:
+                try:
+                    if sb.is_element_visible(sel):
+                        sb.click(sel)
+                        started = True
+                        print(f"✅ 已点击启动按钮: {sel}")
+                        break
+                except Exception:
+                    pass
+            if started:
+                sb.sleep(3)
+                server_info += "\n🔌 已执行启动操作"
+            else:
+                print("⚠️ 未找到启动按钮，请手动启动")
+                server_info += "\n⚠️ 未找到启动按钮，请手动启动"
+        return (
+            f"{server_info}\n📋 续期结果: ✅ 续期成功"
+            f"\n📅 到期时间: {strip_remaining(renewal_time_after or renewal_time_before) or '未获取到'}"
+        )
+
+    print("⚠️ 未检测到续期成功提示，请人工检查")
+    return (
+        f"{server_info}\n📋 续期结果: ⚠️ 续期可能未成功，请登录后台检查"
+        f"\n📅 到期时间: {strip_remaining(renewal_time_after or renewal_time_before) or '未获取到'}"
+    )
+
+
 # 主流程
 def main():
     print("#" * 25)
@@ -456,7 +592,6 @@ def main():
 
             if "dashboard" in current_url and "auth" not in current_url:
                 login_ok = True
-                print("✅ Discord 登录成功, 当前已到达首页 Dashboard")
             else:
                 print(f"❌ Discord 登录后未到达 Dashboard 页面，当前URL: {current_url}, 标题: {current_title}")
 
@@ -484,144 +619,56 @@ def main():
         # 等待 5 秒让状态加载完成
         sb.sleep(5)
 
-        # 获取服务器名称和状态（status-text 的 span 标签）
-        server_name = ""
-        server_status = ""
+        # 获取所有服务器的名称和状态（可能有多台服务器）
         try:
-            server_status = sb.get_text(".server-row .status-text").strip()
+            servers = sb.execute_script("""
+                return Array.from(document.querySelectorAll('.server-row')).map(row => {
+                    const nameEl = row.querySelector('.font-medium.text-white');
+                    const statusEl = row.querySelector('.status-text');
+                    return {
+                        name: nameEl ? nameEl.textContent.trim() : '',
+                        status: statusEl ? statusEl.textContent.trim() : '',
+                    };
+                });
+            """) or []
         except Exception:
-            pass
-        try:
-            server_name = sb.get_text(".server-row .font-medium.text-white").strip()
-        except Exception:
-            pass
-        print(f"🖥️ 服务器: {server_name or '未知'} | 状态: {server_status or '未知'}")
-        is_offline = server_status.lower() == "offline"
-        server_info = f"🖥️ 服务器: {server_name or '未知'} ({server_status or '未知状态'})"
+            servers = []
+        if not servers:
+            servers = [{"name": "", "status": ""}]
+        total = len(servers)
+        print(f"📋 共发现 {total} 台服务器")
 
-        # 点击服务器行进入详情页
-        print("🖱️ 点击服务器，进入服务器详情页...")
-        sb.click(".server-row")
-        sb.wait_for_ready_state_complete()
-        sb.sleep(4)
+        # 循环处理每台服务器
+        results = []
+        for idx, info in enumerate(servers):
+            server_name = (info.get("name") or "").strip()
+            server_status = (info.get("status") or "").strip()
+            print(f"🖥️ 服务器[{idx + 1}/{total}]: {server_name or '未知'} | 状态: {server_status or '未知'}")
 
-        # 校验是否到达服务器详情页（url 中包含 manage?id=）
-        current_url = sb.get_current_url()
-        if "manage?id=" not in current_url:
-            print(f"❌ 未到达服务器详情页，当前URL: {current_url}")
-            send_telegram_message(format_notification("❌ 续期失败", error=f"未到达服务器详情页: {current_url}"))
-            return
-        print(f"✅ 已到达服务器详情页: {current_url}")
+            # 第二台起需先返回 servers 列表页
+            if idx > 0:
+                print(f"🌐 返回 servers 页面处理下一台服务器...")
+                sb.open(f"{BASE_URL}/servers")
+                sb.wait_for_ready_state_complete()
+                sb.sleep(3)
+                try:
+                    sb.wait_for_element_present(".server-row", timeout=15)
+                except Exception:
+                    pass
+                sb.sleep(3)
 
-        # 获取 Next Renewal 倒计时（#renewal-time）
-        def get_renewal_time() -> str:
             try:
-                if sb.is_element_present("#renewal-time"):
-                    return sb.get_text("#renewal-time").strip()
-            except Exception:
-                pass
-            return ""
+                result = process_server(sb, idx, total, server_name, server_status)
+            except Exception as e:
+                print(f"❌ 处理服务器[{idx + 1}/{total}]异常: {e}")
+                result = f"🖥️ 服务器[{idx + 1}/{total}]: {server_name or '未知'}\n📋 续期结果: ❌ 处理异常: {e}"
+            results.append(result)
 
-        renewal_time_before = get_renewal_time()
-        print(f"⏳ Next Renewal: {renewal_time_before or '未获取到'}")
-
-        # 判断 Renewal 按钮是否可用（不可用时按钮带 hidden/disabled，页面显示 renewal-time 倒计时）
-        renew_available = False
-        if sb.is_element_present("#renew-server"):
-            btn_class = sb.get_attribute("#renew-server", "class") or ""
-            try:
-                sb.get_attribute("#renew-server", "disabled")
-                btn_disabled = True
-            except Exception:
-                btn_disabled = False
-            renew_available = ("hidden" not in btn_class) and (not btn_disabled)
-
-        if not renew_available:
-            print(f"ℹ️ 未到续期时间 (Next Renewal: {renewal_time_before or '未知'})")
-            send_telegram_message(format_notification(
-                "ℹ️ 未到续期时间",
-                extra=server_info,
-                expiry_date=renewal_time_before or "未获取到",
-            ))
-            print("🏁 脚本执行完毕")
-            return
-
-        # 点击 Renew Now 按钮执行续期
-        print("🔁 点击 Renew Now 按钮执行续期...")
-        sb.click("#renew-server")
-        sb.sleep(3)
-
-        # 等待 success 提示模态框（alert success）—— 模态框可能几秒就消失
-        success_text = ""
-        for _ in range(5):
-            try:
-                success_text = sb.execute_script("""
-                    const els = document.querySelectorAll('[class*="alert"], [role="alert"], [class*="toast"], [class*="modal"]');
-                    for (const el of els) {
-                        const cls = (el.className || '').toString().toLowerCase();
-                        const txt = (el.textContent || '').replace(/\\s+/g, ' ').trim();
-                        if (!txt) continue;
-                        if (cls.includes('success') || /success|renewed|续期成功/i.test(txt)) {
-                            return txt.slice(0, 200);
-                        }
-                    }
-                    return '';
-                """) or ""
-            except Exception:
-                success_text = ""
-            if success_text:
-                break
-            sb.sleep(1)
-
-        # 续期后再次检查 renewal-time
-        renewal_time_after = get_renewal_time()
-        print(f"⏳ 续期后 Next Renewal: {renewal_time_after or '未获取到'}")
-
-        # 判断续期是否成功：模态框检测到 或 renewal-time 发生明显变化
-        renewal_changed = (
-            renewal_time_after
-            and renewal_time_after != renewal_time_before
-            and "remaining" in renewal_time_after.lower()
-        )
-        renew_success = bool(success_text) or renewal_changed
-
-        if renew_success:
-            if success_text:
-                print(f"✅ 续期成功: {success_text}")
-            else:
-                print(f"✅ 续期成功（renewal-time 变化: {renewal_time_before} → {renewal_time_after}）")
-            # 如果服务器是 Offline 状态，续期后需要启动
-            if is_offline:
-                print("🔌 服务器为 Offline，尝试启动...")
-                started = False
-                for sel in ['button:contains("Start")', '#start-server', 'button:contains("启动")']:
-                    try:
-                        if sb.is_element_visible(sel):
-                            sb.click(sel)
-                            started = True
-                            print(f"✅ 已点击启动按钮: {sel}")
-                            break
-                    except Exception:
-                        pass
-                if started:
-                    sb.sleep(3)
-                    server_info += "\n🔌 已执行启动操作"
-                else:
-                    print("⚠️ 未找到启动按钮，请手动启动")
-                    server_info += "\n⚠️ 未找到启动按钮，请手动启动"
-            extra_detail = success_text if success_text else f"renewal-time: {renewal_time_before} → {renewal_time_after}"
-            send_telegram_message(format_notification(
-                "✅ 续期成功",
-                extra=f"{server_info}\n📋 {extra_detail}",
-                expiry_date=renewal_time_after or renewal_time_before or "未获取到",
-            ))
-        else:
-            print("⚠️ 未检测到续期成功提示，请人工检查")
-            send_telegram_message(format_notification(
-                "⚠️ 续期可能未成功",
-                extra=f"{server_info}\n未检测到成功提示，请登录后台检查",
-                expiry_date=renewal_time_after or renewal_time_before or "未获取到",
-            ))
+        # 汇总发送通知
+        send_telegram_message(format_notification(
+            f"📋 共处理 {total} 台服务器",
+            extra="\n\n".join(results),
+        ))
 
         print("🏁 脚本执行完毕")
 
