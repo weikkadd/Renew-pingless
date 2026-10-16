@@ -39,6 +39,7 @@ jobs:
           DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          IS_PROXY: 'true'
         run: |
           xvfb-run --auto-servernum python3 app.py
 

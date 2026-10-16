@@ -213,7 +213,7 @@ def discord_authorize(state: str, authorize_url: str = "") -> str:
 
     proxies = None
     _is_proxy = os.environ.get("IS_PROXY", "false").lower() == "true"
-    _proxy_server = os.environ.get("PROXY_SERVER", "").strip() or "http://127.0.0.1:1081"
+    _proxy_server = os.environ.get("PROXY_SERVER", "").strip() or "socks5://127.0.0.1:1080"
     if _is_proxy:
         proxies = {"http": _proxy_server, "https": _proxy_server}
 
@@ -559,7 +559,7 @@ def main():
     print("#" * 25)
 
     IS_PROXY = os.environ.get("IS_PROXY", "false").lower() == "true"
-    PROXY_SERVER = os.environ.get("PROXY_SERVER", "").strip() or "http://127.0.0.1:1081"
+    PROXY_SERVER = os.environ.get("PROXY_SERVER", "").strip() or "socks5://127.0.0.1:1080"
     HEADLESS = os.environ.get("HEADLESS", "false").lower() == "true" 
 
     sb_kwargs = {"uc": True, "headless": HEADLESS}
