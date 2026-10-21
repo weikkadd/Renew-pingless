@@ -396,11 +396,26 @@ def do_discord_login(sb) -> bool:
     final_url = ""
     try:
         sess = requests.Session()
-        resp = sess.get(location, headers={"User-Agent": DISCORD_UA}, proxies=proxies,
-                        allow_redirects=True, timeout=25)
+        # 先访问 /auth 建立会话（部分站点需要）
+        try:
+            sess.get(f"{BASE_URL}/auth", headers={"User-Agent": DISCORD_UA}, proxies=proxies, timeout=15)
+        except Exception:
+            pass
+        resp = sess.get(
+            location,
+            headers={
+                "User-Agent": DISCORD_UA,
+                "Referer": f"{BASE_URL}/auth",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+            proxies=proxies, allow_redirects=True, timeout=25,
+        )
         final_url = resp.url
         req_cookies = sess.cookies.get_dict()
-        print(f"📝 requests 回调最终 URL: {final_url}")
+        print(f"📝 callback HTTP {resp.status_code}, 最终 URL: {final_url}")
+        print(f"📝 callback Set-Cookie: {resp.headers.get('set-cookie')}")
+        print(f"📄 callback body[:400]: {resp.text[:400]!r}")
         print(f"🍪 requests 拿到 Cookie: {list(req_cookies.keys())}")
         if "/error/banned" in final_url:
             print("🚫 账号已被封禁")
