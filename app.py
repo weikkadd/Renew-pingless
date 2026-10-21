@@ -404,14 +404,29 @@ def do_discord_login(sb) -> bool:
         sb.save_screenshot("login_fraud.png")
         return False
 
-    for _ in range(30):
-        url = sb.get_current_url()
-        path = urllib.parse.urlparse(url).path
-        if BASE_URL in url and path not in ["/login", "/login/discord"]:
-            print(f"✅ Discord 登录成功！当前页面：{url}")
-            return True
-        time.sleep(0.5)
+    # submitlogin 页面需要 JS 执行完成登录（设置 Cookie 后跳转 dashboard）。
+    # uc_open_with_reconnect 的 reconnect 可能中断 JS，导致停在 submitlogin 不跳转；
+    # 判定成功只认「已离开 submitlogin/login/auth」的路径，停留在回调页则重新加载触发 JS。
+    def login_done(u: str) -> bool:
+        if BASE_URL not in u:
+            return False
+        return urllib.parse.urlparse(u).path not in ["/api/submitlogin", "/login", "/login/discord", "/auth"]
 
+    for attempt in range(3):
+        for _ in range(30):
+            url = sb.get_current_url()
+            if login_done(url):
+                print(f"✅ Discord 登录成功！当前页面：{url}")
+                return True
+            time.sleep(0.5)
+        cur = sb.get_current_url()
+        if attempt < 2:
+            print(f"🔄 页面停留在 {urllib.parse.urlparse(cur).path}，重新加载触发登录处理...")
+            sb.open(cur)
+            sb.wait_for_ready_state_complete()
+            sb.sleep(4)
+
+    url = sb.get_current_url()
     print(f"❌ 登录超时或未跳转成功，最终停留在：{url}")
     try:
         body_text = sb.get_text("body")
