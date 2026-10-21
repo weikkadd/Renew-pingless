@@ -357,8 +357,30 @@ def do_discord_login(sb) -> bool:
 
     print(f"📍 已到达 Discord: {urllib.parse.urlparse(current_url).path}")
 
-    # 优先通过 HTTP 获取授权 URL（避免浏览器 URL 编码问题）
-    authorize_url = fetch_authorize_url_from_site()
+    # 站点 /api/discord/login 会设置 loginAttempt Cookie（防 CSRF，Max-Age=300），
+    # callback 端点会校验它；浏览器点击登录时带了该 Cookie，裸 requests 没有会被拒
+    # （Invalid login attempt）。用同一个 session 请求，拿授权 URL 的同时保留 Cookie。
+    _cb_proxies = None
+    _is_proxy = os.environ.get("IS_PROXY", "false").lower() == "true"
+    _proxy_server = os.environ.get("PROXY_SERVER", "").strip() or "socks5://127.0.0.1:1080"
+    if _is_proxy:
+        _cb_proxies = {"http": _proxy_server, "https": _proxy_server}
+
+    login_sess = requests.Session()
+    authorize_url = ""
+    try:
+        _lr = login_sess.get(
+            f"{BASE_URL}/api/discord/login",
+            allow_redirects=False,
+            headers={"User-Agent": DISCORD_UA},
+            proxies=_cb_proxies, timeout=15,
+        )
+        authorize_url = _lr.headers.get("Location", "")
+        if authorize_url and "discord.com" in authorize_url:
+            print("🔗 从站点重定向获取到授权 URL")
+        print(f"🍪 loginAttempt Cookie: {list(login_sess.cookies.get_dict().keys())}")
+    except Exception as e:
+        print(f"⚠️ HTTP 获取授权 URL 失败: {e}")
 
     # 备用：从浏览器 Discord 页面提取
     if not authorize_url:
@@ -383,36 +405,22 @@ def do_discord_login(sb) -> bool:
     print("↩️ 携带授权码打开回调链接...")
 
     # 回调链为服务端 302 重定向：callback?code=<dc_code> → /api/submitlogin?code=<site_code>
-    # →（设置会话 Cookie）→ dashboard。浏览器 uc_open_with_reconnect 的 reconnect 会中断
-    # 这条 302 链，导致停在 submitlogin 未设置 Cookie。改用 requests 完整跟随重定向拿 Cookie，
-    # 再注入浏览器。
-    proxies = None
-    _is_proxy = os.environ.get("IS_PROXY", "false").lower() == "true"
-    _proxy_server = os.environ.get("PROXY_SERVER", "").strip() or "socks5://127.0.0.1:1080"
-    if _is_proxy:
-        proxies = {"http": _proxy_server, "https": _proxy_server}
-
+    # →（设置会话 Cookie）→ dashboard。用 login_sess 完整跟随重定向
+    # （它已带 loginAttempt Cookie，callback 会校验该 Cookie）。
     req_cookies = {}
     final_url = ""
     try:
-        sess = requests.Session()
-        # 先访问 /auth 建立会话（部分站点需要）
-        try:
-            sess.get(f"{BASE_URL}/auth", headers={"User-Agent": DISCORD_UA}, proxies=proxies, timeout=15)
-        except Exception:
-            pass
-        resp = sess.get(
+        resp = login_sess.get(
             location,
             headers={
                 "User-Agent": DISCORD_UA,
-                "Referer": f"{BASE_URL}/auth",
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
                 "Accept-Language": "en-US,en;q=0.9",
             },
-            proxies=proxies, allow_redirects=True, timeout=25,
+            proxies=_cb_proxies, allow_redirects=True, timeout=25,
         )
         final_url = resp.url
-        req_cookies = sess.cookies.get_dict()
+        req_cookies = login_sess.cookies.get_dict()
         print(f"📝 callback HTTP {resp.status_code}, 最终 URL: {final_url}")
         print(f"📝 callback Set-Cookie: {resp.headers.get('set-cookie')}")
         print(f"📄 callback body[:400]: {resp.text[:400]!r}")
