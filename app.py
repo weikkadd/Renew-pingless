@@ -381,53 +381,63 @@ def do_discord_login(sb) -> bool:
         return False
 
     print("↩️ 携带授权码打开回调链接...")
-    sb.uc_open_with_reconnect(location, reconnect_time=4)
-    time.sleep(3)
 
-    url = sb.get_current_url()
-    if "/error/banned" in url:
-        print("🚫 账号已被封禁")
-        sb.save_screenshot("login_banned.png")
-        return False
+    # 回调链为服务端 302 重定向：callback?code=<dc_code> → /api/submitlogin?code=<site_code>
+    # →（设置会话 Cookie）→ dashboard。浏览器 uc_open_with_reconnect 的 reconnect 会中断
+    # 这条 302 链，导致停在 submitlogin 未设置 Cookie。改用 requests 完整跟随重定向拿 Cookie，
+    # 再注入浏览器。
+    proxies = None
+    _is_proxy = os.environ.get("IS_PROXY", "false").lower() == "true"
+    _proxy_server = os.environ.get("PROXY_SERVER", "").strip() or "socks5://127.0.0.1:1080"
+    if _is_proxy:
+        proxies = {"http": _proxy_server, "https": _proxy_server}
 
-    if BASE_URL not in url:
-        print(f"❌ 回调后未跳转至 Pingless，当前 URL：{url}")
-        sb.save_screenshot("login_no_redirect.png")
-        return False
-
+    req_cookies = {}
+    final_url = ""
     try:
-        body_text = sb.get_text("body")
-    except Exception:
-        body_text = ""
-    if "fraud" in body_text.lower():
-        print("🚫 触发风控（fraud attempt），可能是 IP 被拦截")
-        sb.save_screenshot("login_fraud.png")
-        return False
+        sess = requests.Session()
+        resp = sess.get(location, headers={"User-Agent": DISCORD_UA}, proxies=proxies,
+                        allow_redirects=True, timeout=25)
+        final_url = resp.url
+        req_cookies = sess.cookies.get_dict()
+        print(f"📝 requests 回调最终 URL: {final_url}")
+        print(f"🍪 requests 拿到 Cookie: {list(req_cookies.keys())}")
+        if "/error/banned" in final_url:
+            print("🚫 账号已被封禁")
+            send_telegram_message(format_notification("🚫 账号已被封禁"))
+            return False
+        if "fraud" in resp.text.lower():
+            print("🚫 触发风控（fraud attempt），可能是 IP 被拦截")
+            return False
+    except Exception as e:
+        print(f"⚠️ requests 回调失败: {e}")
 
-    # submitlogin 页面需要 JS 执行完成登录（设置 Cookie 后跳转 dashboard）。
-    # uc_open_with_reconnect 的 reconnect 可能中断 JS，导致停在 submitlogin 不跳转；
-    # 判定成功只认「已离开 submitlogin/login/auth」的路径，停留在回调页则重新加载触发 JS。
     def login_done(u: str) -> bool:
         if BASE_URL not in u:
             return False
         return urllib.parse.urlparse(u).path not in ["/api/submitlogin", "/login", "/login/discord", "/auth"]
 
-    for attempt in range(3):
-        for _ in range(30):
-            url = sb.get_current_url()
-            if login_done(url):
-                print(f"✅ Discord 登录成功！当前页面：{url}")
-                return True
-            time.sleep(0.5)
-        cur = sb.get_current_url()
-        if attempt < 2:
-            print(f"🔄 页面停留在 {urllib.parse.urlparse(cur).path}，重新加载触发登录处理...")
-            sb.open(cur)
-            sb.wait_for_ready_state_complete()
-            sb.sleep(4)
+    # 浏览器打开站点，注入 requests 拿到的会话 Cookie
+    sb.open(f"{BASE_URL}/auth")
+    sb.wait_for_ready_state_complete()
+    for name, value in req_cookies.items():
+        try:
+            sb.add_cookie({"name": name, "value": value, "domain": ".pingless.org", "path": "/"})
+        except Exception as e:
+            print(f"⚠️ 注入 Cookie {name} 失败: {e}")
+
+    # 访问 dashboard 验证登录状态
+    for _ in range(15):
+        sb.open(f"{BASE_URL}/dashboard")
+        sb.wait_for_ready_state_complete()
+        time.sleep(2)
+        url = sb.get_current_url()
+        if login_done(url):
+            print(f"✅ Discord 登录成功！当前页面：{url}")
+            return True
 
     url = sb.get_current_url()
-    print(f"❌ 登录超时或未跳转成功，最终停留在：{url}")
+    print(f"❌ 登录失败，最终停留在：{url}（requests 最终 URL: {final_url}）")
     try:
         body_text = sb.get_text("body")
         print(f"📄 页面正文片段：{body_text[:200].strip()!r}")
