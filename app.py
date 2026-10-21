@@ -586,11 +586,18 @@ def main():
 
         print("🔑 通过 Discord token登录...")
         if do_discord_login(sb):
+            # submitlogin 为 API 端点，登录成功后 Cookie 已设置但页面停留在该 URL，
+            # 主动访问 dashboard 确认登录状态（未登录会被重定向回 /login）
+            print("🔄 登录回调完成，主动访问 dashboard 确认登录状态...")
+            sb.open(f"{BASE_URL}/dashboard")
+            sb.wait_for_ready_state_complete()
+            sb.sleep(3)
             current_url = sb.get_current_url()
             current_title = sb.get_title()
             print(f"📝 当前URL: {current_url}, Title: {current_title}")
 
-            if "dashboard" in current_url and "auth" not in current_url:
+            path = urllib.parse.urlparse(current_url).path
+            if BASE_URL in current_url and path not in ["/login", "/login/discord", "/auth"]:
                 login_ok = True
             else:
                 print(f"❌ Discord 登录后未到达 Dashboard 页面，当前URL: {current_url}, 标题: {current_title}")
