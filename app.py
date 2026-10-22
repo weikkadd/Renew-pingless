@@ -437,7 +437,7 @@ def do_discord_login(sb) -> bool:
         time.sleep(0.5)
 
     url = sb.get_current_url()
-    print(f"❌ 登录失败，最终停留在：{url}（requests 最终 URL: {final_url}）")
+    print(f"❌ 登录失败，最终停留在：{url}")
     try:
         body_text = sb.get_text("body")
         print(f"📄 页面正文片段：{body_text[:200].strip()!r}")
