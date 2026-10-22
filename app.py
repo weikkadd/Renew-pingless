@@ -404,63 +404,43 @@ def do_discord_login(sb) -> bool:
 
     print("↩️ 携带授权码打开回调链接...")
 
-    # 回调链为服务端 302 重定向：callback?code=<dc_code> → /api/submitlogin?code=<site_code>
-    # →（设置会话 Cookie）→ dashboard。用 login_sess 完整跟随重定向
-    # （它已带 loginAttempt Cookie，callback 会校验该 Cookie）。
-    req_cookies = {}
-    final_url = ""
-    try:
-        resp = login_sess.get(
-            location,
-            headers={
-                "User-Agent": DISCORD_UA,
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.9",
-            },
-            proxies=_cb_proxies, allow_redirects=True, timeout=25,
-        )
-        final_url = resp.url
-        req_cookies = login_sess.cookies.get_dict()
-        print(f"📝 callback HTTP {resp.status_code}, 最终 URL: {final_url}")
-        print(f"📝 callback Set-Cookie: {resp.headers.get('set-cookie')}")
-        print(f"📄 callback body[:400]: {resp.text[:400]!r}")
-        print(f"🍪 requests 拿到 Cookie: {list(req_cookies.keys())}")
-        if "/error/banned" in final_url:
-            print("🚫 账号已被封禁")
-            send_telegram_message(format_notification("🚫 账号已被封禁"))
-            return False
-        if "fraud" in resp.text.lower():
-            print("🚫 触发风控（fraud attempt），可能是 IP 被拦截")
-            return False
-    except Exception as e:
-        print(f"⚠️ requests 回调失败: {e}")
-
+    # callback 返回 HTML "Please wait..." 页面（前端 JS 完成登录），必须用浏览器执行 JS；
+    # 且不能用 requests 预访问 callback（会消费 loginAttempt Cookie）。
+    # 浏览器此前点击 /api/discord/login 已带 loginAttempt Cookie；
+    # 用 sb.open（非 uc_open_with_reconnect，避免 reconnect 中断 JS）。
     def login_done(u: str) -> bool:
         if BASE_URL not in u:
             return False
         return urllib.parse.urlparse(u).path not in ["/api/submitlogin", "/login", "/login/discord", "/auth"]
 
-    # 浏览器打开站点，注入 requests 拿到的会话 Cookie
-    sb.open(f"{BASE_URL}/auth")
+    sb.open(location)
     sb.wait_for_ready_state_complete()
-    for name, value in req_cookies.items():
-        try:
-            sb.add_cookie({"name": name, "value": value, "domain": ".pingless.org", "path": "/"})
-        except Exception as e:
-            print(f"⚠️ 注入 Cookie {name} 失败: {e}")
+    time.sleep(5)
+    cur = sb.get_current_url()
+    try:
+        body_text = sb.get_text("body")
+    except Exception:
+        body_text = ""
+    print(f"📝 打开 callback 后 URL: {cur}")
+    print(f"📄 callback 页面正文片段：{body_text[:160].strip()!r}")
+    if "/error/banned" in cur:
+        print("🚫 账号已被封禁")
+        send_telegram_message(format_notification("🚫 账号已被封禁"))
+        return False
+    if "fraud" in body_text.lower():
+        print("🚫 触发风控（fraud attempt），可能是 IP 被拦截")
+        return False
 
-    # 访问 dashboard 验证登录状态
-    for _ in range(15):
-        sb.open(f"{BASE_URL}/dashboard")
-        sb.wait_for_ready_state_complete()
-        time.sleep(2)
+    # 等待前端 JS 完成登录并跳转（callback → submitlogin → dashboard）
+    for _ in range(60):
         url = sb.get_current_url()
         if login_done(url):
             print(f"✅ Discord 登录成功！当前页面：{url}")
             return True
+        time.sleep(0.5)
 
     url = sb.get_current_url()
-    print(f"❌ 登录失败，最终停留在：{url}（requests 最终 URL: {final_url}）")
+    print(f"❌ 登录失败，最终停留在：{url}")
     try:
         body_text = sb.get_text("body")
         print(f"📄 页面正文片段：{body_text[:200].strip()!r}")
