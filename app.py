@@ -155,8 +155,11 @@ def discord_authorize(state: str, authorize_url: str = "") -> str:
         authorize_url = f"{DISCORD_API}?{query}"
 
     # 浏览器提取的可能是 Web 页面 URL，需转换为 API 端点
-    if "/oauth2/authorize" in authorize_url and "/api/" not in authorize_url:
-        authorize_url = authorize_url.replace("/oauth2/authorize", "/api/v9/oauth2/authorize", 1)
+    if "/oauth2/authorize" in authorize_url and "/api/v9/oauth2/authorize" not in authorize_url:
+        # 统一转成 v9 API 端点（站点授权 URL 是网页端点 /api/oauth2/authorize，
+        # 直接用会让授权流程与站点期望不一致）
+        _au = urllib.parse.urlparse(authorize_url)
+        authorize_url = f"https://discord.com/api/v9/oauth2/authorize?{_au.query}"
 
     # 从授权 URL 提取实际参数（确保 redirect_uri 与 Discord 应用注册的一致）
     _parsed = urllib.parse.urlparse(authorize_url)
@@ -363,35 +366,36 @@ def do_discord_login(sb) -> bool:
 
     print(f"📍 已到达 Discord: {urllib.parse.urlparse(current_url).path}")
 
-    # authorize_url 优先从浏览器当前 URL 提取，保持与浏览器同一 session
-    # （浏览器点击登录时已建立 loginAttempt + pingless.sid 会话）。
-    # 若用 requests 重新请求 /api/discord/login 会新建 session，与浏览器 callback 的
-    # 会话不一致，导致 callback/submitlogin 失败或跳回 Discord 登录页。
+    # 全流程用同一个 requests session（login_sess）：站点 /api/discord/login 建立
+    # loginAttempt + pingless.sid 会话，callback → submitlogin 必须沿用该会话。
+    # 浏览器/requests 混用会拆成两个 session 致 submitlogin Internal Error。
     _cb_proxies = None
     _is_proxy = os.environ.get("IS_PROXY", "false").lower() == "true"
     _proxy_server = os.environ.get("PROXY_SERVER", "").strip() or "socks5://127.0.0.1:1080"
     if _is_proxy:
         _cb_proxies = {"http": _proxy_server, "https": _proxy_server}
 
-    authorize_url = extract_discord_authorize_url(current_url)
-    if authorize_url:
-        print("🔗 从浏览器 Discord 页面提取授权 URL")
-    else:
-        # 兜底：HTTP 请求站点（会新建 session，仅在浏览器提取失败时用）
-        try:
-            _lr = requests.get(
-                f"{BASE_URL}/api/discord/login",
-                allow_redirects=False,
-                headers={"User-Agent": DISCORD_UA},
-                proxies=_cb_proxies, timeout=15,
-            )
-            authorize_url = _lr.headers.get("Location", "")
-            if authorize_url and "discord.com" in authorize_url:
-                print("🔗 从站点重定向获取到授权 URL")
-        except Exception as e:
-            print(f"⚠️ HTTP 获取授权 URL 失败: {e}")
-        if not authorize_url and "oauth2/authorize" in current_url:
-            authorize_url = current_url
+    login_sess = requests.Session()
+    authorize_url = ""
+    try:
+        _lr = login_sess.get(
+            f"{BASE_URL}/api/discord/login?remember=1",
+            allow_redirects=False,
+            headers={"User-Agent": DISCORD_UA},
+            proxies=_cb_proxies, timeout=15,
+        )
+        authorize_url = _lr.headers.get("Location", "")
+        if authorize_url and "discord.com" in authorize_url:
+            print("🔗 从站点重定向获取到授权 URL")
+        print(f"🍪 站点 Cookie: {list(login_sess.cookies.get_dict().keys())}")
+    except Exception as e:
+        print(f"⚠️ HTTP 获取授权 URL 失败: {e}")
+
+    if not authorize_url:
+        # 兜底：从浏览器 Discord 页面提取
+        authorize_url = extract_discord_authorize_url(current_url)
+        if authorize_url:
+            print("🔗 从浏览器 Discord 页面提取授权 URL")
 
     if not authorize_url:
         print(f"❌ 无法从 Discord 页面提取授权 URL: {current_url}")
@@ -409,41 +413,63 @@ def do_discord_login(sb) -> bool:
 
     print("↩️ 携带授权码打开回调链接...")
 
-    # callback 需在浏览器中打开（执行前端 JS，且沿用浏览器点击登录时的会话，
-    # 避免 requests 新建 session 与浏览器不一致导致失败）。
+    # callback 返回前端跳板页，JS 内 location.replace('/api/submitlogin?code=<code>')。
+    # 用同一 login_sess 跟随：callback → submitlogin（跟随 302 拿会话 Cookie）。
     def login_done(u: str) -> bool:
         if BASE_URL not in u:
             return False
         return urllib.parse.urlparse(u).path not in ["/api/submitlogin", "/login", "/login/discord", "/auth"]
 
-    sb.open(location)
-    sb.wait_for_ready_state_complete()
-    time.sleep(5)
-    cur = sb.get_current_url()
+    session_cookies = {}
+    final_url = ""
     try:
-        body_text = sb.get_text("body")
-    except Exception:
-        body_text = ""
-    print(f"📝 打开 callback 后 URL: {cur}")
-    print(f"📄 callback 页面正文片段：{body_text[:160].strip()!r}")
-    if "/error/banned" in cur:
-        print("🚫 账号已被封禁")
-        send_telegram_message(format_notification("🚫 账号已被封禁"))
-        return False
-    if "fraud" in body_text.lower():
-        print("🚫 触发风控（fraud attempt），可能是 IP 被拦截")
-        return False
+        resp = login_sess.get(
+            location,
+            headers={"User-Agent": DISCORD_UA, "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
+            proxies=_cb_proxies, allow_redirects=True, timeout=25,
+        )
+        print(f"📝 callback HTTP {resp.status_code}, URL: {resp.url}")
+        if "/error/banned" in resp.url:
+            print("🚫 账号已被封禁")
+            send_telegram_message(format_notification("🚫 账号已被封禁"))
+            return False
+        m = re.search(r"location\.replace\(\s*['\"]([^'\"]*submitlogin[^'\"]*)['\"]", resp.text)
+        if m:
+            submit_url = urllib.parse.urljoin(BASE_URL, m.group(1).strip())
+            print(f"🔗 解析到 submitlogin: {submit_url}")
+            resp = login_sess.get(
+                submit_url,
+                headers={"User-Agent": DISCORD_UA, "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
+                proxies=_cb_proxies, allow_redirects=True, timeout=25,
+            )
+        final_url = resp.url
+        session_cookies = login_sess.cookies.get_dict()
+        print(f"📝 最终 URL: {final_url}")
+        print(f"📄 响应片段: {resp.text[:200]!r}")
+        print(f"🍪 会话 Cookie: {list(session_cookies.keys())}")
+    except Exception as e:
+        print(f"⚠️ requests 回调链失败: {e}")
 
-    # 等待登录完成（dashboard 出现）
-    for _ in range(60):
+    if session_cookies:
+        sb.open(f"{BASE_URL}/")
+        sb.wait_for_ready_state_complete()
+        for name, value in session_cookies.items():
+            try:
+                sb.add_cookie({"name": name, "value": value, "domain": ".pingless.org", "path": "/"})
+            except Exception as e:
+                print(f"⚠️ 注入 Cookie {name} 失败: {e}")
+
+    for _ in range(30):
+        sb.open(f"{BASE_URL}/dashboard")
+        sb.wait_for_ready_state_complete()
+        time.sleep(1.5)
         url = sb.get_current_url()
         if login_done(url):
             print(f"✅ Discord 登录成功！当前页面：{url}")
             return True
-        time.sleep(0.5)
 
     url = sb.get_current_url()
-    print(f"❌ 登录失败，最终停留在：{url}")
+    print(f"❌ 登录失败，最终停留在：{url}（requests 最终 URL: {final_url}）")
     try:
         body_text = sb.get_text("body")
         print(f"📄 页面正文片段：{body_text[:200].strip()!r}")
