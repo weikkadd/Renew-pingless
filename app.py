@@ -437,15 +437,21 @@ def do_discord_login(sb) -> bool:
         if m:
             submit_url = urllib.parse.urljoin(BASE_URL, m.group(1).strip())
             print(f"🔗 解析到 submitlogin: {submit_url}")
-            resp = login_sess.get(
-                submit_url,
-                headers={"User-Agent": DISCORD_UA, "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
-                proxies=_cb_proxies, allow_redirects=True, timeout=25,
-            )
+            for _attempt in range(3):
+                resp = login_sess.get(
+                    submit_url,
+                    headers={"User-Agent": DISCORD_UA, "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
+                    proxies=_cb_proxies, allow_redirects=True, timeout=25,
+                )
+                print(f"🔁 submitlogin 尝试{_attempt+1} HTTP {resp.status_code} → {resp.url}")
+                print(f"📄 Set-Cookie: {resp.headers.get('set-cookie')}")
+                print(f"📄 body: {resp.text[:200]!r}")
+                if "Internal Error" not in resp.text:
+                    break
+                time.sleep(1)
         final_url = resp.url
         session_cookies = login_sess.cookies.get_dict()
         print(f"📝 最终 URL: {final_url}")
-        print(f"📄 响应片段: {resp.text[:200]!r}")
         print(f"🍪 会话 Cookie: {list(session_cookies.keys())}")
     except Exception as e:
         print(f"⚠️ requests 回调链失败: {e}")
