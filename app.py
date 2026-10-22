@@ -164,6 +164,12 @@ def discord_authorize(state: str, authorize_url: str = "") -> str:
     _redirect_uri = _params.get("redirect_uri", [OAUTH_REDIRECT_URI])[0]
     _client_id = _params.get("client_id", [DISCORD_CLIENT_ID])[0]
     _scope = _params.get("scope", [OAUTH_SCOPE])[0]
+    # 站点需要 guilds.join（加入 Discord 服务器）；从浏览器 URL 的 redirect_to 提取的
+    # scope 可能不全（实测只剩 identify email），强制补全为站点要求的完整 scope。
+    _scope_parts = set(_scope.replace(",", " ").split())
+    for _req in ("identify", "email", "guilds.join"):
+        _scope_parts.add(_req)
+    _scope = " ".join(sorted(_scope_parts))
 
     # 确保必要参数在授权 URL 中
     _query = _parsed.query or ""
